@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "csvplot"
+version = "0.19"
+description = "Single-file CLI for turning a CSV into a seaborn plot"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=2.1.1",
+    "numpy",
+    "matplotlib>=3.7.3",
+    "seaborn>=0.13",
+    "pyyaml",
+]
+
+[project.scripts]
+csvplot = "csvplot:_cli_entrypoint"
+
+[tool.setuptools]
+py-modules = ["csvplot"]
