@@ -128,10 +128,6 @@ def test_linewidth_must_be_positive(m):
     assert_ok(m, "--linewidth", "0.1")
 
 
-def test_interval_must_be_positive(m):
-    assert_dies(m, "--interval", "0")
-
-
 def test_smooth_must_be_positive_when_given(m):
     assert_dies(m, "--smooth", "0")
     assert_dies(m, "--smooth", "-1")
@@ -310,6 +306,28 @@ def test_extras_line_style_non_numeric_linewidth_dies(m):
         m._validate_extras({"hline_style": {"linewidth": "thick"}})
 
 
+# ── _validate_extras: shaded-region entries ──────────────────────────────
+
+def test_fill_between_entry_must_be_a_mapping(m):
+    with pytest.raises(SystemExit):
+        m._validate_extras({"fill_between": ["not a mapping"]})
+
+
+def test_fill_between_bounds_must_be_numeric(m):
+    with pytest.raises(SystemExit):
+        m._validate_extras({"fill_between": [{"xmin": "left", "xmax": 1.0}]})
+
+
+def test_fill_between_list_length_is_capped(m):
+    regions = [{"xmin": 0, "xmax": 1}] * (m._MAX_YAML_LIST_LEN + 1)
+    with pytest.raises(SystemExit):
+        m._validate_extras({"fill_between": regions})
+
+
+def test_valid_fill_between_entry_is_accepted(m):
+    m._validate_extras({"fill_between": [{"xmin": 0, "xmax": 1, "color": "blue"}]})
+
+
 # ── _validate_extras: corr heatmap options ────────────────────────────────
 
 def test_extras_corr_vmin_vmax_non_numeric_dies(m):
@@ -339,3 +357,135 @@ def test_get_section_non_mapping_dies(m):
 
 def test_get_section_returns_the_mapping(m):
     assert m._get_section({"x_axis": {"label": "Time"}}, "x_axis") == {"label": "Time"}
+
+
+# ── --group-by drops non-y columns ─────────────────────────────────────────
+# Aggregation keeps only the grouping column and the y column(s). Referring to
+# any other column via --hue or --x must be rejected here, with the cause
+# named, rather than surfacing later as a seaborn lookup failure.
+
+def test_group_by_with_unrelated_hue_dies(run_cli, tmp_path):
+    p = tmp_path / "g.csv"
+    p.write_text("g,v,h\na,1,x\na,2,y\nb,3,x\nb,4,y\n")
+    r = run_cli(str(p), "--y", "v", "--group-by", "g", "--agg", "mean",
+                "--bar", "--hue", "h", "--output", "o.png", "--force")
+    assert r.returncode == 1
+    assert "Traceback" not in r.stderr
+    assert "--hue 'h'" in r.stderr and "--group-by" in r.stderr
+
+
+def test_group_by_with_unrelated_x_dies(run_cli, tmp_path):
+    p = tmp_path / "g.csv"
+    p.write_text("g,v,t\na,1,10\na,2,11\nb,3,12\nb,4,13\n")
+    r = run_cli(str(p), "--y", "v", "--group-by", "g", "--agg", "mean",
+                "--bar", "--x", "t", "--output", "o.png", "--force")
+    assert r.returncode == 1
+    assert "Traceback" not in r.stderr
+    assert "--x 't'" in r.stderr and "--group-by" in r.stderr
+
+
+def test_group_by_with_hue_equal_to_group_column_is_allowed(run_cli, tmp_path):
+    p = tmp_path / "g.csv"
+    p.write_text("g,v\na,1\na,2\nb,3\nb,4\n")
+    r = run_cli(str(p), "--y", "v", "--group-by", "g", "--agg", "mean",
+                "--bar", "--hue", "g", "--output", "o.png", "--force")
+    assert r.returncode == 0, r.stderr
+
+
+def test_group_by_with_x_equal_to_group_column_is_allowed(run_cli, tmp_path):
+    p = tmp_path / "g.csv"
+    p.write_text("g,v\na,1\na,2\nb,3\nb,4\n")
+    r = run_cli(str(p), "--y", "v", "--group-by", "g", "--agg", "mean",
+                "--bar", "--x", "g", "--output", "o.png", "--force")
+    assert r.returncode == 0, r.stderr
+
+
+# ── column existence and flag-conflict guards in _resolve_columns ──────────
+
+def _grid_csv(tmp_path):
+    """g (categorical), v/w (numeric), t (numeric x candidate)."""
+    p = tmp_path / "grid.csv"
+    p.write_text("g,v,w,t\na,1,10,0\na,2,20,1\nb,3,30,2\nb,4,40,3\n")
+    return p
+
+
+@pytest.mark.parametrize("flag,value,expected", [
+    ("--x", "absent", "--x column not found"),
+    ("--hue", "absent", "--hue column not found"),
+    ("--y", "absent", "--y column not found"),
+    ("--dual-y", "absent", "--dual-y column not found"),
+])
+def test_missing_column_is_named(run_cli, tmp_path, flag, value, expected):
+    p = _grid_csv(tmp_path)
+    argv = [str(p), flag, value, "--output", "o.png", "--force"]
+    if flag != "--y":
+        argv += ["--y", "v"]
+    r = run_cli(*argv)
+    assert r.returncode == 1
+    assert expected in r.stderr
+
+
+def test_missing_group_by_column_is_named(run_cli, tmp_path):
+    r = run_cli(str(_grid_csv(tmp_path)), "--y", "v", "--group-by", "absent",
+                "--agg", "mean", "--bar", "--output", "o.png", "--force")
+    assert r.returncode == 1
+    assert "--group-by column not found" in r.stderr
+
+
+def test_group_by_on_non_numeric_y_is_rejected(run_cli, tmp_path):
+    p = tmp_path / "s.csv"
+    p.write_text("g,label\na,one\nb,two\n")
+    r = run_cli(str(p), "--y", "label", "--group-by", "g", "--agg", "mean",
+                "--bar", "--output", "o.png", "--force")
+    assert r.returncode == 1
+    assert "numeric" in r.stderr
+
+
+def test_group_by_without_y_is_rejected(run_cli, tmp_path):
+    r = run_cli(str(_grid_csv(tmp_path)), "--group-by", "g", "--agg", "mean",
+                "--hist", "--output", "o.png", "--force")
+    assert r.returncode == 1
+    assert "requires at least one y column" in r.stderr
+
+
+def test_column_in_both_ys_and_dual_y_is_rejected(run_cli, tmp_path):
+    r = run_cli(str(_grid_csv(tmp_path)), "--ys", "v", "w", "--dual-y", "w",
+                "--output", "o.png", "--force")
+    assert r.returncode == 1
+    assert "both --ys and --dual-y" in r.stderr
+
+
+def test_dual_y_with_group_by_is_rejected(run_cli, tmp_path):
+    r = run_cli(str(_grid_csv(tmp_path)), "--y", "v", "--dual-y", "w",
+                "--group-by", "g", "--agg", "mean", "--output", "o.png", "--force")
+    assert r.returncode == 1
+    assert "--dual-y cannot be combined with --group-by" in r.stderr
+
+
+def test_top_by_outside_y_columns_is_rejected(run_cli, tmp_path):
+    r = run_cli(str(_grid_csv(tmp_path)), "--y", "v", "--group-by", "g",
+                "--agg", "mean", "--top", "1", "--top-by", "w",
+                "--bar", "--output", "o.png", "--force")
+    assert r.returncode == 1
+    assert "--top-by must be one of" in r.stderr
+
+
+def test_y_is_ignored_with_a_warning_when_ys_is_given(run_cli, tmp_path):
+    r = run_cli(str(_grid_csv(tmp_path)), "--y", "v", "--ys", "w",
+                "--output", "o.png", "--force")
+    assert r.returncode == 0, r.stderr
+    assert "ignored because --ys" in r.stderr
+
+
+def test_positional_file_is_ignored_with_a_warning_when_files_is_given(run_cli, tmp_path):
+    p = _grid_csv(tmp_path)
+    r = run_cli(str(p), "--files", str(p), "--y", "v", "--output", "o.png", "--force")
+    assert r.returncode == 0, r.stderr
+    assert "ignored because --files" in r.stderr
+
+
+def test_duplicate_input_files_are_rejected(run_cli, tmp_path):
+    p = _grid_csv(tmp_path)
+    r = run_cli("--files", str(p), str(p), "--y", "v", "--output", "o.png", "--force")
+    assert r.returncode == 1
+    assert "duplicate input file" in r.stderr

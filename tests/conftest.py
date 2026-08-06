@@ -11,6 +11,20 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def pytest_collection_modifyitems(config, items):
+    """
+    Mark every test that launches csvplot.py as a subprocess with 'slow'.
+
+    Each such launch costs roughly 3.7 seconds, almost all of it importing
+    seaborn, and they account for essentially the whole suite runtime. Marking
+    is derived from fixture use rather than applied by hand so it cannot drift
+    as tests are added. Run 'pytest -m "not slow"' for the in-process subset.
+    """
+    for item in items:
+        if "run_cli" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.slow)
+
+
 @pytest.fixture
 def run_cli(tmp_path):
     """Run csvplot.py as a subprocess with cwd=tmp_path. Returns CompletedProcess."""

@@ -363,3 +363,29 @@ output:
     yaml_path.write_text(yaml_text)
     r = run_cli(str(csv_numeric), "--yaml", str(yaml_path), "--output", "o.png", "--force")
     assert r.returncode == 0, r.stderr
+
+
+# ── _load_yaml_defaults: failure paths and multi-element coercion ─────────
+
+def test_malformed_yaml_reports_a_parse_error(m, tmp_path):
+    p = _write_yaml(tmp_path, "data:\n  x: [unclosed\n")
+    with pytest.raises(SystemExit):
+        m._load_yaml_defaults(str(p), m.build_parser())
+
+
+def test_missing_yaml_file_dies(m, tmp_path):
+    with pytest.raises(SystemExit):
+        m._load_yaml_defaults(str(tmp_path / "absent.yaml"), m.build_parser())
+
+
+def test_two_element_option_coerces_each_element(m, tmp_path):
+    """--clip takes nargs=2; YAML strings must be coerced element-wise."""
+    p = _write_yaml(tmp_path, "clip: ['1.5', '9.5']\n")
+    defaults, _ = m._load_yaml_defaults(str(p), m.build_parser())
+    assert defaults["clip"] == [1.5, 9.5]
+
+
+def test_uncoercible_value_dies_with_the_key_named(m, tmp_path):
+    p = _write_yaml(tmp_path, "rolling: 'not-a-number'\n")
+    with pytest.raises(SystemExit):
+        m._load_yaml_defaults(str(p), m.build_parser())

@@ -246,3 +246,79 @@ def test_dual_y_series_gets_same_default_color_on_every_panel(m, tmp_path):
     dual_y_calls = [c for c in lineplot_calls if c.get("y") == "ref"]
     assert len(dual_y_calls) == 2  # one per panel
     assert dual_y_calls[0]["color"] == dual_y_calls[1]["color"]
+
+
+# ── _overlay_linear_fit ───────────────────────────────────────────────────
+# The --fit linear overlay. Uses a real Axes because the assertions are about
+# the line that ends up on it, not about a call signature.
+
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+
+@pytest.fixture
+def real_ax():
+    fig, a = plt.subplots()
+    yield a
+    plt.close(fig)
+
+
+def _fit_args(m, **kw):
+    return base_args(**{"linewidth": 1.5, "alpha": 1.0, **kw})
+
+
+def test_linear_fit_draws_a_line_with_the_expected_slope(m, real_ax):
+    df = pd.DataFrame({"x": [0.0, 1.0, 2.0, 3.0], "y": [1.0, 3.0, 5.0, 7.0]})
+    m._overlay_linear_fit(df, "x", "y", real_ax, _fit_args(m))
+    assert len(real_ax.lines) == 1
+    xs, ys = real_ax.lines[0].get_data()
+    slope = (ys[-1] - ys[0]) / (xs[-1] - xs[0])
+    assert slope == pytest.approx(2.0)
+
+
+def test_linear_fit_labels_the_line_for_the_legend(m, real_ax):
+    df = pd.DataFrame({"x": [0.0, 1.0, 2.0], "y": [0.0, 1.0, 2.0]})
+    m._overlay_linear_fit(df, "x", "y", real_ax, _fit_args(m))
+    assert real_ax.lines[0].get_label() == "y fit"
+
+
+def test_linear_fit_draws_left_to_right_on_unsorted_input(m, real_ax):
+    """The fit line is drawn over sorted x so it renders as one clean stroke."""
+    df = pd.DataFrame({"x": [3.0, 0.0, 2.0, 1.0], "y": [7.0, 1.0, 5.0, 3.0]})
+    m._overlay_linear_fit(df, "x", "y", real_ax, _fit_args(m))
+    xs = real_ax.lines[0].get_data()[0]
+    assert list(xs) == sorted(xs)
+
+
+def test_linear_fit_ignores_rows_with_missing_values(m, real_ax):
+    df = pd.DataFrame({"x": [0.0, 1.0, None, 3.0], "y": [1.0, 3.0, 99.0, 7.0]})
+    m._overlay_linear_fit(df, "x", "y", real_ax, _fit_args(m))
+    xs, ys = real_ax.lines[0].get_data()
+    assert len(xs) == 3
+    assert (ys[-1] - ys[0]) / (xs[-1] - xs[0]) == pytest.approx(2.0)
+
+
+def test_linear_fit_coerces_non_numeric_values(m, real_ax):
+    df = pd.DataFrame({"x": ["0", "1", "junk"], "y": ["1", "3", "5"]})
+    m._overlay_linear_fit(df, "x", "y", real_ax, _fit_args(m))
+    assert len(real_ax.lines) == 1
+
+
+@pytest.mark.parametrize("df_kw", [
+    {"x": [1.0], "y": [2.0]},                       # single point
+    {"x": [1.0, None], "y": [2.0, 3.0]},             # one usable pair
+    {"x": [float("nan")] * 3, "y": [1.0, 2.0, 3.0]},  # nothing usable
+])
+def test_linear_fit_skipped_when_fewer_than_two_points(m, real_ax, df_kw):
+    m._overlay_linear_fit(pd.DataFrame(df_kw), "x", "y", real_ax, _fit_args(m))
+    assert len(real_ax.lines) == 0
+
+
+def test_linear_fit_on_constant_x_does_not_raise(m, real_ax, capsys):
+    """Degenerate x makes the fit rank-deficient; it must warn, not crash."""
+    df = pd.DataFrame({"x": [2.0, 2.0, 2.0], "y": [1.0, 2.0, 3.0]})
+    m._overlay_linear_fit(df, "x", "y", real_ax, _fit_args(m))
+    if len(real_ax.lines) == 0:
+        assert "linear fit" in capsys.readouterr().err

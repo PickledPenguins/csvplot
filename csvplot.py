@@ -38,10 +38,11 @@ Common patterns
 ────────────────────────────────────────────────────────────────────────────
 Requires: seaborn ≥ 0.13, matplotlib ≥ 3.7.3, pandas ≥ 2.1.1, numpy
 """
-__version__ = "0.19"
+__version__ = "0.26"
 
 import argparse
 import ast
+import importlib.util
 import math
 import sys
 import json
@@ -54,8 +55,51 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+
+
+# ── Deferred imports ──────────────────────────────────────────────────────────
+
+class _LazyModule:
+    """
+    Stand-in for a module that is imported on first attribute access.
+
+    Importing seaborn costs roughly 2.9 seconds beyond numpy and pandas,
+    because it pulls in matplotlib and scipy. Most invocations never draw
+    anything — --help, --version, --headers, --info, --stats, --export-json,
+    --export-csv,
+    --percentile and every argument-validation failure all exit before a
+    figure exists — so paying that cost at module import made the common
+    cases several times slower than the work they actually do.
+
+    The proxy is a module-level name rather than an import inside each
+    function so that call sites read unchanged (`sns.lineplot(...)`) and so
+    that `unittest.mock.patch("csvplot.sns.lineplot")` keeps working: patch
+    reads the attribute (triggering the real import), sets its replacement on
+    the proxy instance, and deletes it again on exit, after which lookups
+    fall through to the real module.
+    """
+
+    def __init__(self, name):
+        # bypass __setattr__ indirection concerns by writing straight to the
+        # instance dict; _module doubles as the "not yet imported" sentinel
+        self.__dict__["_name"] = name
+        self.__dict__["_module"] = None
+
+    def _load(self):
+        """Import the wrapped module once and cache it."""
+        if self.__dict__["_module"] is None:
+            import importlib
+            self.__dict__["_module"] = importlib.import_module(self.__dict__["_name"])
+        return self.__dict__["_module"]
+
+    def __getattr__(self, attr):
+        # only reached for names absent from the instance dict, so a patched
+        # attribute shadows the real one without any special handling here
+        return getattr(self._load(), attr)
+
+
+plt = _LazyModule("matplotlib.pyplot")
+sns = _LazyModule("seaborn")
 
 
 # ── Module-level constants ────────────────────────────────────────────────────
@@ -81,11 +125,21 @@ _CAT_MODES = frozenset({"box", "violin", "bar", "swarm"})
 
 # seaborn ≥ 0.12 replaced the deprecated 'ci' kwarg in barplot with 'errorbar'.
 # packaging is a transitive dependency of matplotlib, so this is always available.
-try:
-    from packaging.version import Version
-    _SNS_GE_012 = Version(sns.__version__) >= Version("0.12")
-except Exception:
-    _SNS_GE_012 = True  # assume modern seaborn if the version string is unparseable
+# Resolved on first use rather than at import: reading sns.__version__ would
+# force the seaborn import that the lazy proxy above exists to avoid.
+_sns_ge_012_cache = None
+
+
+def _sns_ge_012():
+    """True when the installed seaborn takes barplot's 'errorbar' kwarg."""
+    global _sns_ge_012_cache
+    if _sns_ge_012_cache is None:
+        try:
+            from packaging.version import Version
+            _sns_ge_012_cache = Version(sns.__version__) >= Version("0.12")
+        except Exception:
+            _sns_ge_012_cache = True  # unparseable version string — assume modern
+    return _sns_ge_012_cache
 
 # Keys accepted in YAML only — deliberately absent from the CLI to keep it concise.
 # They provide per-series styling, fine-grained axes/legend control, plot-mode
@@ -254,7 +308,13 @@ def build_parser():
     g.add_argument("--files", nargs="+", metavar="FILE",
                    help="Load multiple files and overlay them on the same plot")
     g.add_argument("--sep", default=",", metavar="SEP",
-                   help="Column delimiter (default: ','; use '\\t' for TSV)")
+                   help="Column delimiter (default: ','; use '\\t' for TSV). Literal "
+                        "'\\t'/'\\n'/'\\r' escapes are translated to the characters they "
+                        "name; any other multi-character value is treated as a regex")
+    g.add_argument("--encoding", default="utf-8-sig", metavar="ENC",
+                   help="Input text encoding (default: utf-8-sig, i.e. UTF-8 with an "
+                        "optional byte-order mark). Use e.g. latin-1 or cp1252 for "
+                        "files that are not valid UTF-8")
     g.add_argument("--no-parse-units", action="store_true",
                    help="Disable automatic unit-suffix coercion (e.g. '10ms' → 0.01)")
     g.add_argument("--unit-parse-threshold", type=float, default=1.0, metavar="F",
@@ -303,6 +363,9 @@ def build_parser():
                    help="Figure resolution in DPI for saved files (default: 100; use 300 for print)")
     g.add_argument("--export-json", action="store_true",
                    help="Print post-transform data as JSON then exit without plotting")
+    g.add_argument("--export-csv", action="store_true",
+                   help="Print post-transform data as CSV then exit without plotting; "
+                        "the output is valid input, so runs can be chained through a pipe")
     g.add_argument("--force",  action="store_true",
                    help="Overwrite --output file if it already exists")
 
@@ -399,15 +462,6 @@ def build_parser():
     g = p.add_argument_group("Computed statistics  [text output, no plot]")
     g.add_argument("--percentile", nargs="+", type=float, metavar="P",
                    help="Compute percentiles in 0–100 range, e.g. --percentile 25 50 75")
-
-    # ── Live mode (not yet implemented) ────────────────────────────────────
-    g = p.add_argument_group("Live mode  [not yet implemented]")
-    g.add_argument("--watch",    action="store_true",
-                   help="[NOT YET IMPLEMENTED] Re-read and redraw the file every --interval seconds")
-    g.add_argument("--interval", type=float, default=1.0, metavar="SEC",
-                   help="Polling interval for --watch in seconds (default: 1.0)")
-    g.add_argument("--alert",    nargs="+", metavar="EXPR",
-                   help="[NOT YET IMPLEMENTED] Print a warning when a column threshold expression fires")
 
     # ── Axes / layout ──────────────────────────────────────────────────────
     g = p.add_argument_group("Axes / layout")
@@ -531,7 +585,28 @@ _MAX_YAML_LIST_LEN = 1000
 _MAX_YAML_NODES = 100_000
 
 
-def load_dataframe(file, sep, max_rows, head_hint=None):
+# Escape sequences accepted in --sep, translated to the character they name.
+# Deliberately minimal: pandas treats any separator longer than one character
+# as a regular expression, so blanket unescaping would break legitimate regex
+# separators such as '\\s+'. Only these three are translated, which covers the
+# documented '\\t' TSV case without touching regex syntax.
+_SEP_ESCAPES = {"\\t": "\t", "\\n": "\n", "\\r": "\r"}
+
+
+def _decode_sep(sep):
+    """
+    Translate a literal escape sequence typed on the command line (e.g. the
+    two characters backslash-t) into the character it names.
+
+    Shells pass '\\t' through verbatim, and pandas would then see a
+    two-character separator, fall back to its slower python parser engine and
+    emit a ParserWarning. Translating here keeps the fast C parser on the
+    documented TSV invocation.
+    """
+    return _SEP_ESCAPES.get(sep, sep)
+
+
+def load_dataframe(file, sep, max_rows, head_hint=None, encoding="utf-8-sig"):
     """
     Load a delimited file; provide actionable error messages on all failure paths.
     head_hint, when given, reads only its first N rows directly (bypassing the
@@ -546,11 +621,19 @@ def load_dataframe(file, sep, max_rows, head_hint=None):
             size_mb = 0  # let pd.read_csv raise the real error below
         if size_mb > _MAX_FILE_SIZE_MB:
             die(f"{file!r} is {size_mb:.0f} MB, exceeding the {_MAX_FILE_SIZE_MB} MB limit")
+    # stdin is read through its raw buffer so --encoding applies there too;
+    # the already-decoded text stream would ignore it (and would leave a
+    # byte-order mark attached to the first column name).
+    source = sys.stdin.buffer if file == "-" else file
     try:
-        df = pd.read_csv(sys.stdin if file == "-" else file, sep=sep,
+        df = pd.read_csv(source, sep=_decode_sep(sep), encoding=encoding,
                           nrows=head_hint if head_hint is not None else max_rows + 1)
     except FileNotFoundError:     die(f"file not found: {file}")
     except PermissionError:       die(f"permission denied: {file}")
+    except UnicodeDecodeError as e:
+        die(f"could not decode {file!r} as {encoding!r}: {e}\n"
+            f"       retry with --encoding, e.g. --encoding latin-1")
+    except LookupError:           die(f"unknown --encoding: {encoding!r}")
     except pd.errors.ParserError as e: die(f"CSV parse error in {file!r}: {e}")
     except Exception as e:        die(f"could not load {file!r}: {e}")
     if len(df.columns) > _MAX_COLS:
@@ -1007,6 +1090,12 @@ def _validate_extras(extras):
     for k, valid in _EXTRA_CHOICES.items():
         if k in extras and extras[k] not in valid:
             die(f"YAML: invalid value {extras[k]!r} for '{k}', must be one of {sorted(valid)}")
+    # seaborn defers its own check until the draw call, where it raises a bare
+    # RuntimeError; catching it here keeps the failure consistent with every
+    # other missing-prerequisite message and reports it before any work starts.
+    if extras.get("regplot_robust") and importlib.util.find_spec("statsmodels") is None:
+        die("YAML: 'robust: true' under a regplot needs the optional 'statsmodels' "
+            "package; install it or set robust: false")
     for k in ("xlim", "ylim", "dual_y_lim"):
         if k in extras:
             v = extras[k]
@@ -1082,7 +1171,6 @@ def _validate_args(args):
     if not 0.0 <= args.unit_parse_threshold <= 1.0:
         die("--unit-parse-threshold must be between 0.0 and 1.0")
     if args.linewidth <= 0:          die("--linewidth must be > 0")
-    if args.interval  <= 0:          die("--interval must be > 0")
     if args.smooth is not None and args.smooth <= 0: die("--smooth sigma must be > 0")
     if not 0 <= args.ci <= 100:      die("--ci must be between 0 and 100")
     if args.percentile and any(not 0.0 <= p <= 100.0 for p in args.percentile):
@@ -1097,6 +1185,8 @@ def _validate_args(args):
         die("--vline values must be finite numbers")
     if args.normalize and args.zscore:
         die("--normalize and --zscore are mutually exclusive")
+    if args.export_json and args.export_csv:
+        die("--export-json and --export-csv are mutually exclusive")
 
     # validate --group-by dependent flags
     if args.top and not args.group_by:
@@ -1370,17 +1460,25 @@ class _PlotContext:
 
 
 def _plot_line(ctx):
+    # 'label' is omitted entirely when hue is in play rather than passed as
+    # None: seaborn builds one legend entry per hue level internally and
+    # supplies its own label, so any explicit label -- None included --
+    # collides with it and raises a TypeError from deep inside matplotlib.
+    kw = dict(ctx.line_kw)
+    if not ctx.hue:
+        kw["label"] = ctx.label
     sns.lineplot(data=ctx.df, x=ctx.x_col, y=ctx.y_col, hue=ctx.hue,
-                 label=ctx.label if not ctx.hue else None,
-                 palette=ctx.palette, ax=ctx.ax, **ctx.line_kw)
+                 palette=ctx.palette, ax=ctx.ax, **kw)
 
 
 def _plot_scatter(ctx):
     scatter_kw = {**ctx.dist_kw}
     if "scatter_s" in ctx.px:
         scatter_kw["s"] = ctx.px["scatter_s"]
+    # see _plot_line: an explicit label conflicts with seaborn's per-hue legend
+    if not ctx.hue:
+        scatter_kw["label"] = ctx.label
     sns.scatterplot(data=ctx.df, x=ctx.x_col, y=ctx.y_col, hue=ctx.hue,
-                    label=ctx.label if not ctx.hue else None,
                     palette=ctx.palette, ax=ctx.ax, **scatter_kw)
 
 
@@ -1442,7 +1540,7 @@ def _plot_violin(ctx):
 def _plot_bar(ctx):
     args = ctx.args
     ci_kw = ({"errorbar": ("ci", args.ci) if args.ci > 0 else None}
-             if _SNS_GE_012 else {"ci": args.ci if args.ci > 0 else None})
+             if _sns_ge_012() else {"ci": args.ci if args.ci > 0 else None})
     sns.barplot(data=ctx.df, x=_categorical_x(ctx.x_col), y=ctx.y_col, hue=ctx.hue,
                 palette=ctx.palette, ax=ctx.ax, **ci_kw)
 
@@ -1648,15 +1746,22 @@ def _parse_args():
     if pre.yaml:
         yaml_defs, yaml_x = _load_yaml_defaults(pre.yaml, p)
         p.set_defaults(**yaml_defs)
-    args = p.parse_args()
-    if args.watch or args.alert:
-        die("--watch and --alert are not yet implemented")
-    return args, yaml_x
+    return p.parse_args(), yaml_x
+
+
+def _is_text_only(args):
+    """
+    True when the requested mode produces text on stdout and never renders a
+    figure. Such runs ignore --output entirely, so output-path validation must
+    not reject them.
+    """
+    return bool(args.headers or args.info or args.stats
+                or args.export_json or args.export_csv or args.percentile)
 
 
 def _check_output(args):
     """Validate output path early — before expensive rendering."""
-    if not args.output:
+    if not args.output or _is_text_only(args):
         return
     out_path = Path(args.output)
     if not out_path.parent.exists():
@@ -1696,7 +1801,8 @@ def _load_frames(args):
     solo_head = (args.head if (args.head is not None and args.tail is None and not args.filter
                                 and not args.sort and args.sample is None and args.every is None)
                  else None)
-    frames = {src: load_dataframe(src, args.sep, args.max_rows, head_hint=solo_head)
+    frames = {src: load_dataframe(src, args.sep, args.max_rows, head_hint=solo_head,
+                                  encoding=args.encoding)
               for src in sources}
     if not args.no_parse_units:
         frames = {s: _coerce_units(df,
@@ -1716,7 +1822,8 @@ def _resolve_columns(frames, args):
         _warn(f"--y {args.y!r} ignored because --ys was also specified")
     ycols = list(dict.fromkeys(ycols))  # deduplicate, preserve order
 
-    y_optional = (args.hist or args.corr or args.percentile or args.pairplot or args.kde)
+    y_optional = (args.hist or args.corr or args.percentile or args.pairplot
+                  or args.kde or args.stats)
     if not ycols:
         if args.group_by:
             die("--group-by requires at least one y column via --y or --ys")
@@ -1744,6 +1851,19 @@ def _resolve_columns(frames, args):
         if args.group_by:
             die("--dual-y cannot be combined with --group-by: aggregation drops "
                 "non-y columns. Aggregate first, then plot with --dual-y.")
+
+    if args.group_by:
+        # groupby(...)[ycols].agg(...) keeps only the grouping column and the y
+        # columns; anything else is gone by the time plotting happens. Reject
+        # references to dropped columns here, where the cause can be named,
+        # rather than letting seaborn fail later with a generic "could not
+        # interpret value" message that points at the wrong thing.
+        survivors = {args.group_by, *ycols}
+        for flag, col in (("--hue", args.hue), ("--x", args.x)):
+            if col and col not in survivors:
+                die(f"{flag} {col!r} cannot be combined with --group-by {args.group_by!r}: "
+                    f"aggregation keeps only the grouping column and the y column(s) "
+                    f"{sorted(survivors)}. Aggregate first, then plot the result.")
 
     if args.top_by and args.top_by not in ycols:
         die(f"--top-by must be one of --y/--ys: {args.top_by!r} not in {ycols}")
@@ -1828,28 +1948,52 @@ def _print_info(frames):
 
 def _text_output(frames, args, ycols):
     """
-    Handle all text-only output modes (--stats, --export-json, --percentile).
+    Handle all text-only output modes (--stats, --export-json, --export-csv,
+    --percentile).
     Returns True if a text mode was active and the caller should return early.
     """
     if args.stats:
         for src, df in frames.items():
-            cols = ycols or df.select_dtypes(include="number").columns.tolist()
+            cols = _resolve_plot_columns(df, ycols, True)
+            if not cols:
+                die("--stats: no numeric columns found; use --y to specify")
             print(f"=== {src} ===" if len(frames) > 1 else "=== descriptive statistics ===",
                   file=sys.stderr)
             print(df[cols].describe().to_string())
         return True
 
     if args.export_json:
+        # _IDX_COL is an internal sentinel added when no --x was given; it is a
+        # copy of the row number and would otherwise appear as a real column in
+        # machine-readable output that downstream consumers parse.
         out = {s: {c: [_json_safe(v) for v in vals]
-                   for c, vals in df.to_dict(orient="list").items()}
+                   for c, vals in df.to_dict(orient="list").items() if c != _IDX_COL}
                for s, df in frames.items()}
         print(json.dumps(out))
+        return True
+
+    if args.export_csv:
+        # Emitted so that the result is itself valid input: no index column, and
+        # the internal row-index sentinel dropped. Missing values are written as
+        # empty fields, which read back as NaN, so a chained run sees the same
+        # frame this one produced.
+        outs = [df.drop(columns=[_IDX_COL], errors="ignore") for df in frames.values()]
+        if len(outs) > 1:
+            # Several inputs cannot be one flat table without saying which row
+            # came from where; the added column doubles as a --hue. Concatenated
+            # into one frame so a single header is written and differing column
+            # sets align instead of being stacked into ragged rows.
+            outs = [df.assign(source=src) for src, df in zip(frames, outs)]
+            out = pd.concat(outs, ignore_index=True)
+        else:
+            out = outs[0]
+        out.to_csv(sys.stdout, index=False)
         return True
 
     if args.percentile:
         q = [p / 100.0 for p in args.percentile]
         for s, df in frames.items():
-            cols = ycols or df.select_dtypes(include="number").columns.tolist()
+            cols = _resolve_plot_columns(df, ycols, True)
             if not cols:
                 die("--percentile: no numeric columns found; use --y to specify")
             try:
@@ -1891,9 +2035,9 @@ def _render_special(frames, args, ycols, yaml_x):
                 _warn(f"pairplot KDE diagonal failed ({e}); falling back to histogram")
                 g = sns.pairplot(df_pp, hue=args.hue, diag_kind="hist",
                                  plot_kws={"alpha": args.alpha})
-        except (ValueError, OverflowError) as e:
-            die(f"could not render pairplot: {e} (often caused by "
-                f"extremely large or non-finite values)")
+        except Exception as e:
+            die(f"could not render pairplot: {type(e).__name__}: {e} (often "
+                f"caused by extremely large, non-finite or entirely missing values)")
         if args.title:
             g.figure.suptitle(args.title, y=1.02)
         _finalize_figure(g.figure, args, yaml_x, close_all=True)
@@ -1920,8 +2064,8 @@ def _render_special(frames, args, ycols, yaml_x):
                         fmt=yaml_x.get("corr_fmt", ".2f"), cmap=yaml_x.get("corr_cmap", "coolwarm"),
                         vmin=yaml_x.get("corr_vmin", -1), vmax=yaml_x.get("corr_vmax", 1),
                         square=True, linewidths=0.5, ax=ax)
-        except (ValueError, OverflowError) as e:
-            die(f"could not render correlation heatmap: {e}")
+        except Exception as e:
+            die(f"could not render correlation heatmap: {type(e).__name__}: {e}")
         print(corr.to_string())
         if args.title:
             fig.suptitle(args.title, fontsize="large")
@@ -1972,18 +2116,20 @@ def _build_figure(frames, args, ycols, x_col, yaml_x):
             try:
                 _plot_single(df_long, "_variable", "_value", prefix + "data", mode, axs[0], args,
                              px=yaml_x)
-            except (ValueError, OverflowError) as e:
-                die(f"could not render {cols_to_plot}: {e} (often caused by "
-                    f"extremely large or non-finite values)")
+            except Exception as e:
+                die(f"could not render {cols_to_plot}: {type(e).__name__}: {e} "
+                    f"(often caused by extremely large, non-finite or entirely "
+                    f"missing values)")
         else:
             for i, c in enumerate(cols_to_plot):
                 ax_i = axs[min(i, len(axs) - 1)]
                 so = _series_style(yaml_x, "y_", i)
                 try:
                     _plot_single(df, x_col, c, prefix + c, mode, ax_i, args, so=so, px=yaml_x)
-                except (ValueError, OverflowError) as e:
-                    die(f"could not render '{c}': {e} (often caused by "
-                        f"extremely large or non-finite values)")
+                except Exception as e:
+                    die(f"could not render '{c}': {type(e).__name__}: {e} (often "
+                        f"caused by extremely large, non-finite or entirely "
+                        f"missing values)")
                 if args.fit == "linear" and mode in {"line", "scatter"}:
                     _overlay_linear_fit(df, x_col, c, ax_i, args)
 
@@ -2022,9 +2168,10 @@ def _build_figure(frames, args, ycols, x_col, yaml_x):
                         kw["marker"] = marker
                     try:
                         sns.lineplot(data=df, x=x_col, y=c, ax=ax_r, label=f"{c} →", **kw)
-                    except (ValueError, OverflowError) as e:
-                        die(f"could not render dual-y '{c}': {e} (often caused by "
-                            f"extremely large or non-finite values)")
+                    except Exception as e:
+                        die(f"could not render dual-y '{c}': {type(e).__name__}: {e} "
+                            f"(often caused by extremely large, non-finite or "
+                            f"entirely missing values)")
             ax_r.set_ylabel(args.dual_y_label or ", ".join(args.dual_y))
             if yaml_x.get("dual_y_lim"):
                 ax_r.set_ylim(yaml_x["dual_y_lim"])
@@ -2100,7 +2247,11 @@ def main():
             "       run 'csvplot --help' for usage")
 
     _check_output(args)
-    _apply_theme(args, yaml_x)
+    # The theme is a seaborn call, and seaborn is imported lazily, so applying
+    # it up front would load seaborn even for runs that never draw anything.
+    # Text-only modes skip it; the theme has no bearing on their output.
+    if not _is_text_only(args):
+        _apply_theme(args, yaml_x)
 
     frames = _load_frames(args)
 

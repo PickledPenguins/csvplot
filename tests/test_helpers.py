@@ -271,3 +271,83 @@ def test_yaml_depth_budget_stops_alias_amplification(m):
     d = m._yaml_depth(parsed)
     assert time.time() - t0 < 2.0
     assert d > m._MAX_YAML_DEPTH
+
+
+# ── _json_safe ────────────────────────────────────────────────────────────
+# --export-json must emit strict JSON. json.dumps would otherwise write the
+# non-standard NaN/Infinity literals, and pd.NA/numpy scalars/Decimal are not
+# serialisable at all.
+
+def test_json_safe_pd_na_becomes_null(m):
+    assert m._json_safe(pd.NA) is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_json_safe_non_finite_float_becomes_null(m, value):
+    assert m._json_safe(value) is None
+
+
+def test_json_safe_finite_float_passes_through(m):
+    assert m._json_safe(1.5) == 1.5
+
+
+def test_json_safe_numpy_scalar_becomes_python_scalar(m):
+    import numpy as np
+    result = m._json_safe(np.int64(7))
+    assert result == 7 and not isinstance(result, np.generic)
+
+
+def test_json_safe_non_finite_numpy_scalar_becomes_null(m):
+    import numpy as np
+    assert m._json_safe(np.float64("inf")) is None
+
+
+def test_json_safe_decimal_becomes_float(m):
+    from decimal import Decimal
+    result = m._json_safe(Decimal("2.50"))
+    assert result == 2.5 and isinstance(result, float)
+
+
+def test_json_safe_non_finite_decimal_becomes_null(m):
+    from decimal import Decimal
+    assert m._json_safe(Decimal("Infinity")) is None
+
+
+def test_json_safe_leaves_strings_alone(m):
+    assert m._json_safe("text") == "text"
+
+
+# ── _series_range ─────────────────────────────────────────────────────────
+# Feeds the dual-y scale-ratio heuristic, which must never be the thing that
+# fails a plot; every failure path returns 0.0.
+
+def test_series_range_spans_all_frames(m):
+    frames = {"a": pd.DataFrame({"v": [1.0, 3.0]}), "b": pd.DataFrame({"v": [10.0]})}
+    assert m._series_range(frames, "v") == 9.0
+
+
+def test_series_range_all_nan_column_is_zero(m):
+    frames = {"a": pd.DataFrame({"v": [float("nan"), float("nan")]})}
+    assert m._series_range(frames, "v") == 0.0
+
+
+def test_series_range_missing_column_is_zero(m):
+    assert m._series_range({"a": pd.DataFrame({"v": [1.0]})}, "absent") == 0.0
+
+
+def test_series_range_non_numeric_column_is_zero(m):
+    assert m._series_range({"a": pd.DataFrame({"v": ["x", "y"]})}, "v") == 0.0
+
+
+# ── parse_units: per-value conversion edges ───────────────────────────────
+
+def test_parse_units_preserves_missing_values(m):
+    out = m.parse_units(pd.Series(["10ms", None, "20ms"]))
+    assert out.isna().sum() == 1
+    assert out.iloc[0] == pytest.approx(0.01)
+
+
+def test_parse_units_overflowing_exponent_becomes_nan(m):
+    """1e309 overflows to inf, which must be normalised to NaN, not plotted."""
+    out = m.parse_units(pd.Series(["1e309ms", "1ms"]), threshold=0.0)
+    assert out.isna().iloc[0]
